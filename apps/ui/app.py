@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict, List
 
 import requests
+from urllib.parse import quote_plus
 import streamlit as st
 
 
@@ -13,6 +14,24 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="SyllabusSync", layout="wide")
 st.title("SyllabusSync")
+
+
+def new_session_reset() -> None:
+    try:
+        resp = requests.post(f"{API_BASE_URL}/documents/reset", timeout=30)
+        resp.raise_for_status()
+        deleted = resp.json().get("deleted", 0)
+        # Clear local UI state
+        st.session_state.pop("chat_messages", None)
+        st.session_state.pop("selected_version_id", None)
+        st.success(f"Reset complete. Removed {deleted} documents.")
+    except Exception as e:
+        st.error(f"Reset failed: {e}")
+
+
+# Global reset control
+if st.button("New session (reset)"):
+    new_session_reset()
 
 
 def list_documents() -> List[Dict[str, Any]]:
@@ -57,7 +76,9 @@ def upload_and_notify(file_name: str, content_type: str, data: bytes) -> Dict[st
             timeout=30,
         )
         notify.raise_for_status()
-        return notify.json()
+        res = notify.json()
+        res["storage_uri"] = prej["storage_uri"]
+        return res
     except Exception as e:
         st.error(f"Upload failed: {e}")
         return None
@@ -66,20 +87,43 @@ def upload_and_notify(file_name: str, content_type: str, data: bytes) -> Dict[st
 tab1, tab2, tab3 = st.tabs(["Upload", "Chat", "Calendar"])
 
 with tab1:
-    st.subheader("Upload Syllabi (batch supported)")
+    st.subheader("Upload Syllabus (Batch Supported)")
     files = st.file_uploader("Choose PDF files", type=["pdf"], accept_multiple_files=True)
     if st.button("Upload & Index", disabled=(not files)):
-        statuses: list[str] = []
+        previews: list[dict[str, object]] = []
         for f in files or []:
             info = upload_and_notify(f.name, f.type or "application/pdf", f.read())
             if info:
-                statuses.append(
-                    f"✅ {f.name}: document_id={info['document_id']} version_id={info['document_version_id']}"
-                )
+                previews.append({
+                    "file": f.name,
+                    "storage_uri": info.get("storage_uri"),
+                    "document_id": info["document_id"],
+                    "version_id": info["document_version_id"],
+                    "status": "success",
+                })
                 st.session_state["selected_version_id"] = info["document_version_id"]
             else:
-                statuses.append(f"❌ {f.name}: failed")
-        st.write("\n".join(statuses))
+                previews.append({
+                    "file": f.name,
+                    "storage_uri": None,
+                    "document_id": "-",
+                    "version_id": "-",
+                    "status": "failed",
+                })
+        st.success("Upload complete")
+        # Render previews as dropdowns (expanders) with embedded PDFs
+        for item in previews:
+            if item["status"] != "success":
+                st.error(f"{item['file']}: failed")
+                continue
+            title = f"{item['file']} (doc {item['document_id']}, v{item['version_id']})"
+            with st.expander(title, expanded=False):
+                storage_uri = item.get("storage_uri")
+                if storage_uri:
+                    pdf_url = f"{API_BASE_URL}/files/preview?storage_uri={quote_plus(storage_uri)}"
+                    st.components.v1.iframe(pdf_url, height=480)
+                else:
+                    st.caption("Preview unavailable")
 
 with tab2:
     st.subheader("Chat")
@@ -108,9 +152,9 @@ with tab2:
                 cits = data.get("citations", [])
                 if cits:
                     with st.expander("Citations"):
-                        for c in cits:
-                            st.caption(f"doc {c['document_id']} p.{c['page']}")
-                            st.write(c["snippet"]) 
+                        # citations are page numbers only
+                        for p in cits:
+                            st.caption(f"page {p}")
         except Exception as e:
             st.error(f"Chat failed: {e}")
 

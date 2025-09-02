@@ -81,6 +81,8 @@ services:
       - api
     ports:
       - "8501:8501"
+    volumes:
+      - ../..:/app
 
 volumes:
   pgdata:

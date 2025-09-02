@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from fastapi import APIRouter
 from sqlalchemy import text
@@ -88,6 +88,7 @@ class ChatRequest(BaseModel):
     scope: str = Field(default="all", description="all|recent|ids")
     ids: Optional[List[int]] = None
     k: int = 5
+    version_ids: Optional[List[int]] = None
 
 
 @router.post("/chat")
@@ -110,54 +111,149 @@ def chat(body: ChatRequest) -> dict:
             # no documents
             return {"question": q, "answer": "No documents found.", "top_chunks": []}
 
-        # Build SQL over user's documents
-        sql = text(
-            """
-            WITH q AS (SELECT :embedding :: vector AS v)
-            SELECT c.id as chunk_id, c.page_number, c.text, dv.id as document_version_id, d.id as document_id,
-                   1 - (e.vector <=> (SELECT v FROM q)) as score
-            FROM chunks c
-            JOIN embeddings e ON e.chunk_id = c.id
-            JOIN document_versions dv ON dv.id = c.document_version_id
-            JOIN documents d ON d.id = dv.document_id
-            WHERE d.user_id = :user_id
-              AND (:use_ids = 0 OR d.id = ANY(:ids))
-            ORDER BY e.vector <=> (SELECT v FROM q)
-            LIMIT :k
-            """
-        )
-        ids = body.ids or []
-        use_ids = 1 if ids else 0
-        rows = db.execute(
-            sql,
-            {"embedding": v, "user_id": default_user.id, "k": body.k, "use_ids": use_ids, "ids": ids},
-        ).mappings().all()
+        # Optional: infer course tokens from query to restrict scope
+        import re
+        tokens = set(re.findall(r"\b([A-Z]{2,}\s?\d{3})\b", q.upper()))
+        inferred_ids: List[int] = []
+        if tokens:
+            like_patterns = [f"%{t.replace(' ', '')}%" for t in tokens]
+            # Try to match titles containing the token (ignoring spaces)
+            all_docs = db.query(Document).filter(Document.user_id == default_user.id).all()
+            for d in all_docs:
+                title_norm = d.title.upper().replace(" ", "")
+                if any(p.strip('%') in title_norm for p in like_patterns):
+                    inferred_ids.append(d.id)
 
-    top_chunks = [
-        {
+        # fetch more candidates, then rebalance per document
+        fetch_limit = max(20, body.k * 4)
+        # Optional exam-only filter if query implies exam-related
+        exam_query = False
+        q_lower = q.lower()
+        if any(term in q_lower for term in ["exam", "midterm", "final"]):
+            exam_query = True
+
+        if body.version_ids:
+            # Strict scope: only specified document versions (minimal context per upload)
+            sql = text(
+                """
+                WITH q AS (SELECT :embedding :: vector AS v)
+                SELECT c.id as chunk_id, c.page_number, c.text, dv.id as document_version_id, d.id as document_id, d.title as document_title,
+                       1 - (e.vector <=> (SELECT v FROM q)) as score
+                FROM chunks c
+                JOIN embeddings e ON e.chunk_id = c.id
+                JOIN document_versions dv ON dv.id = c.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE dv.id = ANY(:version_ids)
+                ORDER BY e.vector <=> (SELECT v FROM q)
+                LIMIT :limit
+                """
+            )
+            rows = db.execute(
+                sql,
+                {"embedding": v, "version_ids": body.version_ids, "limit": fetch_limit},
+            ).mappings().all()
+        else:
+            # User-scope: optional doc ids and latest version per document
+            sql = text(
+                """
+                WITH q AS (SELECT :embedding :: vector AS v)
+                SELECT c.id as chunk_id, c.page_number, c.text, dv.id as document_version_id, d.id as document_id, d.title as document_title,
+                       1 - (e.vector <=> (SELECT v FROM q)) as score
+                FROM chunks c
+                JOIN embeddings e ON e.chunk_id = c.id
+                JOIN document_versions dv ON dv.id = c.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE d.user_id = :user_id
+                  AND (:use_ids = 0 OR d.id = ANY(:ids))
+                  AND dv.id = (
+                    SELECT max(dv2.id) FROM document_versions dv2 WHERE dv2.document_id = d.id
+                  )
+                ORDER BY e.vector <=> (SELECT v FROM q)
+                LIMIT :limit
+                """
+            )
+            # decide ids: explicit ids > inferred tokens
+            ids = body.ids or (inferred_ids if inferred_ids else [])
+            use_ids = 1 if ids else 0
+            rows = db.execute(
+                sql,
+                {"embedding": v, "user_id": default_user.id, "limit": fetch_limit, "use_ids": use_ids, "ids": ids},
+            ).mappings().all()
+
+    # Basic exam-term prefilter: retain rows whose text mentions exam terms when relevant
+    if exam_query:
+        filtered_rows = []
+        for r in rows:
+            tl = (r["text"] or "").lower()
+            if ("exam" in tl) or ("midterm" in tl) or ("final" in tl):
+                filtered_rows.append(r)
+        if filtered_rows:
+            rows = filtered_rows
+
+    # Rebalance and de-duplicate: cap per document and remove near-duplicates
+    def norm_text(t: str) -> str:
+        import re
+        t = t.lower().strip()
+        t = re.sub(r"https?://\S+", " ", t)
+        t = re.sub(r"\s+", " ", t)
+        return t
+
+    def sim(a: str, b: str) -> float:
+        aset, bset = set(a.split()), set(b.split())
+        if not aset or not bset:
+            return 0.0
+        inter = len(aset & bset)
+        denom = max(1, min(len(aset), len(bset)))
+        return inter / denom
+
+    per_doc_cap = max(2, body.k // 2) if body.k > 2 else 1
+    lambda_div = 0.7
+    selected: List[Dict] = []
+    selected_norms: List[str] = []
+    per_doc_counts: Dict[int, int] = {}
+    # MMR-like selection
+    for r in rows:
+        doc_id = r["document_id"]
+        if per_doc_counts.get(doc_id, 0) >= per_doc_cap:
+            continue
+        cand_norm = norm_text(r["text"] or "")
+        if any(sim(cand_norm, s) > 0.9 for s in selected_norms):  # drop near-duplicates
+            continue
+        mmr_penalty = 0.0
+        if selected_norms:
+            mmr_penalty = max(sim(cand_norm, s) for s in selected_norms)
+        mmr_score = float(r["score"]) - lambda_div * mmr_penalty
+        # Greedy accept (since rows are already roughly sorted by score)
+        selected.append({
             "chunk_id": r["chunk_id"],
             "page": r["page_number"],
             "text": r["text"],
-            "document_id": r["document_id"],
+            "document_id": doc_id,
             "document_version_id": r["document_version_id"],
-            "score": r["score"],
-        }
-        for r in rows
-    ]
+            "document_title": r["document_title"],
+            "score": mmr_score,
+        })
+        selected_norms.append(cand_norm)
+        per_doc_counts[doc_id] = per_doc_counts.get(doc_id, 0) + 1
+        if len(selected) >= body.k:
+            break
+    top_chunks = selected
 
     # Synthesize with context and short history
     settings = get_settings()
     answer = None
-    citations = [
-        {"document_id": c["document_id"], "page": c["page"], "snippet": c["text"][:200]}
-        for c in top_chunks
-    ]
+    # citations: only page numbers
+    citations = [c["page"] for c in top_chunks]
 
     if settings.llm_provider.lower() == "openai" and settings.openai_api_key:
         import requests
 
-        context = "\n---\n".join([c["text"] for c in top_chunks])
-        prompt_user = f"Question: {q}\n\nUse the context below and include citations like [page].\n\nContext:\n{context}"
+        context = "\n---\n".join([f"[doc: {c['document_title']}]\n{c['text']}" for c in top_chunks])
+        course_hint = ", focusing ONLY on the requested course(s) if specified" if tokens else ""
+        prompt_user = (
+            f"Question: {q}\n\nUse the context below and include citations like [page]{course_hint}.\n"
+            f"Do not mix information from different courses unless explicitly asked.\n\nContext:\n{context}"
+        )
         messages = [{"role": "system", "content": "You are a helpful assistant for course syllabi."}]
         # include short history (up to last 3 user/assistant turns, excluding the final user which we add fresh)
         hist = body.messages[-6:]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from apps.api.schemas.uploads import (
@@ -48,5 +49,36 @@ def notify(body: NotifyUploadRequest) -> NotifyUploadResponse:
     # enqueue parse job; chunking and embeddings are chained inside worker
     parse_pdf.delay(ver_id, body.storage_uri)
     return NotifyUploadResponse(document_id=doc_id, document_version_id=ver_id, job_enqueued=True)
+
+
+# Preview: proxy the PDF bytes so the browser can render without direct MinIO access
+import re
+import io
+import boto3
+from packages.common.config import get_settings
+
+
+def _download_s3(storage_uri: str) -> bytes:
+    settings = get_settings()
+    m = re.match(r"s3://([^/]+)/(.+)", storage_uri)
+    if not m:
+        raise ValueError("invalid storage_uri")
+    bucket, key = m.groups()
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        aws_access_key_id=settings.s3_access_key,
+        aws_secret_access_key=settings.s3_secret_key,
+        region_name=settings.s3_region,
+        use_ssl=settings.s3_secure,
+    )
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return obj["Body"].read()
+
+
+@router.get("/preview")
+def preview(storage_uri: str) -> StreamingResponse:
+    data = _download_s3(storage_uri)
+    return StreamingResponse(io.BytesIO(data), media_type="application/pdf")
 
 

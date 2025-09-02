@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from sqlalchemy.orm import Session
 
 from apps.api.db.session import db_session
-from apps.api.db.models import Document, DocumentVersion
+from apps.api.db.models import Document, DocumentVersion, User
 
 
 router = APIRouter(prefix="/documents", tags=["documents"]) 
@@ -28,5 +28,19 @@ def list_versions(doc_id: int) -> list[dict]:
             {"id": v.id, "pages": v.pages, "created_at": v.created_at.isoformat()}
             for v in vers
         ]
+
+
+@router.post("/reset")
+def reset_documents(purge_storage: bool = False) -> dict:
+    # MVP: default dev user only
+    deleted = 0
+    with db_session() as db:
+        user = db.query(User).filter(User.email == "dev@local").one_or_none()
+        if not user:
+            return {"deleted": 0}
+        # Optional: best-effort S3 deletion could be added here
+        deleted = db.query(Document).filter(Document.user_id == user.id).delete(synchronize_session=False)
+        db.commit()
+    return {"deleted": int(deleted)}
 
 
